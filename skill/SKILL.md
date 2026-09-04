@@ -22,10 +22,10 @@ The token is short-lived. Re-run `scripts/auth.sh` when a call starts returning 
 
 ## Non-negotiable operating rules
 
-- Every `commands/*` call requires an `Idempotency-Key` header. Reuse the same key only when retrying the exact same request — a different body with a reused key is rejected as a conflict (`data.code: idempotency_conflict`), not silently applied.
-- Every mutating command that targets an existing record takes `expected_version`, the version you last read. A stale value is rejected (`data.code: version_conflict`) rather than silently overwritten — re-read the record and retry with the current version.
-- Some commands (`delete-listing`) require a human's explicit approval before they execute — see "Delete with confirmation" below. Never fabricate an approval or skip the confirmation step.
-- Reading an execution's context also requires its own `Idempotency-Key` — every read is audited, not just every write.
+- Every `commands/*` call requires an `Idempotency-Key` header. Reuse the same key only when retrying the exact same request: a different body with a reused key is rejected as a conflict (`data.code: idempotency_conflict`), not silently applied.
+- Every mutating command that targets an existing record takes `expected_version`, the version you last read. A stale value is rejected (`data.code: version_conflict`) rather than silently overwritten: re-read the record and retry with the current version.
+- Some commands (`delete-listing`) require a human's explicit approval before they execute: see "Delete with confirmation" below. Never fabricate an approval or skip the confirmation step.
+- Reading an execution's context also requires its own `Idempotency-Key`: every read is audited, not just every write.
 - Never persist the PocketBase token to disk; re-authenticate per session.
 
 ## Read resources
@@ -57,11 +57,11 @@ curl -s -X POST "$TEMPLATE_URL/api/template/v1/commands/request-assessment" \
   -d '{"listing_id":"'"$LISTING_ID"'","expected_version":1}'
 ```
 
-`request-assessment` returns `{"execution_id": "...", "input_hash": "..."}` and queues a pending unit of AI work — it does not run the assessment itself.
+`request-assessment` returns `{"execution_id": "...", "input_hash": "..."}` and queues a pending unit of AI work: it does not run the assessment itself.
 
 ## Delete with confirmation
 
-`delete-listing` doesn't execute on the first call — it proposes, and waits for a human to decide:
+`delete-listing` doesn't execute on the first call. It proposes, and waits for a human to decide:
 
 ```bash
 DELETE_KEY="delete-listing-$(uuidgen)"
@@ -87,7 +87,7 @@ curl -s -X POST "$TEMPLATE_URL/api/template/v1/commands/delete-listing" \
   -d '{"listing_id":"'"$LISTING_ID"'","expected_version":1,"confirmation_id":"'"$CONFIRMATION_ID"'"}'
 ```
 
-Decline with `{"decision":"decline"}` instead — a declined confirmation cannot be bypassed by resubmitting (`data.code: confirmation_declined`). Replaying the original proposal while it's still pending is safe and returns the same `confirmation_id`, not a duplicate.
+Decline with `{"decision":"decline"}` instead: a declined confirmation cannot be bypassed by resubmitting (`data.code: confirmation_declined`). Replaying the original proposal while it's still pending is safe and returns the same `confirmation_id`, not a duplicate.
 
 ## Claim and execute AI work
 
@@ -117,7 +117,7 @@ else
 fi
 ```
 
-A lease is exclusive and expires after 30 minutes if not completed, at which point another `claim-next` call can reclaim it. Posting a result twice with the same execution is safe — the second call replays the original outcome rather than reapplying it. Reading context twice with the same `Idempotency-Key` replays the same bundle unchanged; reusing that key for a different execution or a different lease token is a conflict — use a fresh key (e.g. tied to the execution id) per genuinely new read.
+A lease is exclusive and expires after 30 minutes if not completed, at which point another `claim-next` call can reclaim it. Posting a result twice with the same execution is safe: the second call replays the original outcome rather than reapplying it. Reading context twice with the same `Idempotency-Key` replays the same bundle unchanged; reusing that key for a different execution or a different lease token is a conflict: use a fresh key (e.g. tied to the execution id) per genuinely new read.
 
 ## Authenticate via SSO
 
@@ -127,7 +127,7 @@ If `GET /api/template/v1/auth/oidc/config` reports `"enabled": true`, a client c
 TOKEN="$(TEMPLATE_URL=https://template.example.com scripts/auth-oidc.sh)"
 ```
 
-That script fetches the config, performs the device-authorization flow **directly against the provider** (never against this service), and exchanges the resulting `id_token` for a PocketBase token — the same shape `scripts/auth.sh` returns. If the identity isn't linked yet, the exchange fails with `403` / `data.code: identity_unlinked`; sign in another way first (e.g. the password flow), then link it once, deliberately:
+That script fetches the config, performs the device-authorization flow **directly against the provider** (never against this service), and exchanges the resulting `id_token` for a PocketBase token (the same shape `scripts/auth.sh` returns). If the identity isn't linked yet, the exchange fails with `403` / `data.code: identity_unlinked`; sign in another way first (e.g. the password flow), then link it once, deliberately:
 
 ```bash
 jq -n --arg id_token "$ID_TOKEN" '{id_token:$id_token}' |
@@ -139,7 +139,7 @@ This service never creates an account automatically just because a valid identit
 
 ## Errors and receipts
 
-Every conflict has a stable `data.code` in the response body — branch on that, not on `message` (which is a human-readable sentence and may be reworded):
+Every conflict has a stable `data.code` in the response body: branch on that, not on `message` (which is a human-readable sentence and may be reworded):
 
 | `data.code` | status | meaning |
 |---|---|---|
@@ -150,5 +150,5 @@ Every conflict has a stable `data.code` in the response body — branch on that,
 | `confirmation_declined` | 409 | a human declined this action; it cannot be resubmitted as-is |
 | `confirmation_already_decided` | 409 | tried to flip a confirmation that already has a different, terminal decision |
 | `identity_invalid` | 401 | the OIDC identity token failed verification |
-| `identity_unlinked` | 403 | a verified identity has no linked account yet — link one first |
+| `identity_unlinked` | 403 | a verified identity has no linked account yet: link one first |
 | `identity_already_linked` | 409 | this identity (or this account) is already linked to someone else |
