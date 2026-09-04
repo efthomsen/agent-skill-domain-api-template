@@ -11,10 +11,12 @@ import (
 )
 
 // RegisterRoutes wires the leased AI-execution loop onto rg under
-// httpapi.APIPrefix: claim-next, read context, post a result.
+// httpapi.APIPrefix: claim-next, read context, post a result. Reading
+// context is a POST, not a GET, because each read is itself audited and
+// requires its own Idempotency-Key — see ReadContext.
 func RegisterRoutes(rg *router.Router[*core.RequestEvent], cfg Config) {
 	rg.POST(httpapi.APIPrefix+"/ai/executions/claim-next", claimNextAction(cfg)).Bind(apis.RequireAuth())
-	rg.GET(httpapi.APIPrefix+"/ai/executions/{id}/context", contextAction(cfg)).Bind(apis.RequireAuth())
+	rg.POST(httpapi.APIPrefix+"/ai/executions/{id}/context", contextAction(cfg)).Bind(apis.RequireAuth())
 	rg.POST(httpapi.APIPrefix+"/ai/executions/{id}/result", resultAction(cfg)).Bind(apis.RequireAuth())
 }
 
@@ -36,9 +38,13 @@ func claimNextAction(cfg Config) func(*core.RequestEvent) error {
 
 func contextAction(cfg Config) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
+		idempotencyKey := httpapi.Header(e, "Idempotency-Key")
+		if idempotencyKey == "" {
+			return apis.NewBadRequestError("Idempotency-Key header is required.", nil)
+		}
 		id := e.Request.PathValue("id")
 		leaseToken := httpapi.Header(e, "X-Lease-Token")
-		ctx, err := LoadContext(e.App, cfg, id, leaseToken)
+		ctx, err := ReadContext(e.App, cfg, id, leaseToken, httpapi.AuthID(e), idempotencyKey)
 		if err != nil {
 			return err
 		}

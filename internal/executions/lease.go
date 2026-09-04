@@ -7,6 +7,8 @@
 package executions
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -98,6 +100,70 @@ func LoadContext(app core.App, cfg Config, id, leaseToken string) (map[string]an
 		"input":        httpapi.JSONField(rec, "input_json", map[string]any{}),
 		"input_hash":   rec.GetString("input_hash"),
 	}, nil
+}
+
+// ReadContext wraps LoadContext with an audit trail: each read must carry
+// its own Idempotency-Key, independent of the execution's own creation
+// and lease keys. Replaying the same key returns the exact original
+// bundle without touching the lease again; a new key always logs a fresh
+// row — even when the underlying bundle is identical to a prior read —
+// because the read event itself is what's being audited, not just the
+// data. Reusing a key with a different execution id or lease token is a
+// conflict, the same way a mutating command's Idempotency-Key is.
+func ReadContext(app core.App, cfg Config, id, leaseToken, userID, idempotencyKey string) (map[string]any, error) {
+	requestHash, err := httpapi.HashCanonical(map[string]any{"execution_id": id, "lease_token": leaseToken})
+	if err != nil {
+		return nil, err
+	}
+
+	var result map[string]any
+
+	txErr := app.RunInTransaction(func(tx core.App) error {
+		existing, ferr := tx.FindFirstRecordByFilter(
+			"execution_context_reads",
+			"user_id = {:user} && idempotency_key = {:key}",
+			dbx.Params{"user": userID, "key": idempotencyKey},
+		)
+		if ferr != nil && !errors.Is(ferr, sql.ErrNoRows) {
+			return ferr
+		}
+		if existing != nil {
+			if existing.GetString("request_hash") != requestHash {
+				return httpapi.IdempotencyConflictError()
+			}
+			if decoded, ok := httpapi.JSONField(existing, "response_json", nil).(map[string]any); ok {
+				result = decoded
+			}
+			return nil
+		}
+
+		bundle, err := LoadContext(tx, cfg, id, leaseToken)
+		if err != nil {
+			return err
+		}
+
+		ledgerCollection, err := tx.FindCollectionByNameOrId("execution_context_reads")
+		if err != nil {
+			return err
+		}
+		ledgerRecord := core.NewRecord(ledgerCollection)
+		ledgerRecord.Set("user_id", userID)
+		ledgerRecord.Set("execution_id", id)
+		ledgerRecord.Set("idempotency_key", idempotencyKey)
+		ledgerRecord.Set("lease_token", leaseToken)
+		ledgerRecord.Set("request_hash", requestHash)
+		ledgerRecord.Set("response_json", bundle)
+		if err := tx.Save(ledgerRecord); err != nil {
+			return err
+		}
+
+		result = bundle
+		return nil
+	})
+	if txErr != nil {
+		return nil, txErr
+	}
+	return result, nil
 }
 
 // SubmitResult applies an agent's output to the execution's target record

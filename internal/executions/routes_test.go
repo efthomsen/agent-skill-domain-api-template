@@ -93,8 +93,8 @@ func TestClaimContextResultRoundTrip(t *testing.T) {
 		t.Fatalf("expected to claim the pending execution, got %v", execution)
 	}
 
-	ctxRec := testsupport.Do(t, handler, http.MethodGet, httpapi.APIPrefix+"/ai/executions/exec00000000001/context", token, nil,
-		map[string]string{"X-Lease-Token": leaseToken})
+	ctxRec := testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/exec00000000001/context", token, map[string]any{},
+		map[string]string{"X-Lease-Token": leaseToken, "Idempotency-Key": "context-1"})
 	if ctxRec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for context, got %d: %s", ctxRec.Code, ctxRec.Body.String())
 	}
@@ -203,9 +203,93 @@ func TestContextWithoutLeaseTokenIsForbidden(t *testing.T) {
 	seedExecution(t, pbApp, "exec00000000001", "listing00000001", "pending")
 	testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/claim-next", token, map[string]any{}, nil)
 
-	rec := testsupport.Do(t, handler, http.MethodGet, httpapi.APIPrefix+"/ai/executions/exec00000000001/context", token, nil, nil)
+	rec := testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/exec00000000001/context", token, map[string]any{},
+		map[string]string{"Idempotency-Key": "context-1"})
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 without a lease token, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestContextReadRequiresIdempotencyKey(t *testing.T) {
+	pbApp := testsupport.NewMigratedApp(t)
+	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")
+	rg := testsupport.NewRouter(t, pbApp)
+	executions.RegisterRoutes(rg, testConfig(t))
+	handler := testsupport.BuildHandler(t, rg)
+	token := testsupport.AuthToken(t, user)
+
+	seedListing(t, pbApp, "listing00000001")
+	seedExecution(t, pbApp, "exec00000000001", "listing00000001", "pending")
+	claim := testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/claim-next", token, map[string]any{}, nil)
+	leaseToken := testsupport.Decode(t, claim)["lease_token"].(string)
+
+	rec := testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/exec00000000001/context", token, map[string]any{},
+		map[string]string{"X-Lease-Token": leaseToken})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without Idempotency-Key, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestContextReadReplayIsIdempotent(t *testing.T) {
+	pbApp := testsupport.NewMigratedApp(t)
+	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")
+	rg := testsupport.NewRouter(t, pbApp)
+	executions.RegisterRoutes(rg, testConfig(t))
+	handler := testsupport.BuildHandler(t, rg)
+	token := testsupport.AuthToken(t, user)
+
+	seedListing(t, pbApp, "listing00000001")
+	seedExecution(t, pbApp, "exec00000000001", "listing00000001", "pending")
+	claim := testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/claim-next", token, map[string]any{}, nil)
+	leaseToken := testsupport.Decode(t, claim)["lease_token"].(string)
+	headers := map[string]string{"X-Lease-Token": leaseToken, "Idempotency-Key": "context-1"}
+
+	first := testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/exec00000000001/context", token, map[string]any{}, headers)
+	second := testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/exec00000000001/context", token, map[string]any{}, headers)
+	if first.Code != http.StatusOK || second.Code != http.StatusOK {
+		t.Fatalf("expected both reads to return 200, got %d and %d", first.Code, second.Code)
+	}
+	if testsupport.Decode(t, first)["input_hash"] != testsupport.Decode(t, second)["input_hash"] {
+		t.Fatal("expected the replayed context to match the original")
+	}
+
+	count, err := pbApp.CountRecords("execution_context_reads")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 audit row after replaying the same key, got %d", count)
+	}
+}
+
+func TestContextReadKeyReuseWithDifferentRequestConflicts(t *testing.T) {
+	pbApp := testsupport.NewMigratedApp(t)
+	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")
+	rg := testsupport.NewRouter(t, pbApp)
+	executions.RegisterRoutes(rg, testConfig(t))
+	handler := testsupport.BuildHandler(t, rg)
+	token := testsupport.AuthToken(t, user)
+
+	seedListing(t, pbApp, "listing00000001")
+	seedExecution(t, pbApp, "exec00000000001", "listing00000001", "pending")
+	claim := testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/claim-next", token, map[string]any{}, nil)
+	leaseToken := testsupport.Decode(t, claim)["lease_token"].(string)
+	key := map[string]string{"Idempotency-Key": "context-1"}
+
+	first := testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/exec00000000001/context", token, map[string]any{},
+		map[string]string{"X-Lease-Token": leaseToken, "Idempotency-Key": key["Idempotency-Key"]})
+	if first.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", first.Code, first.Body.String())
+	}
+
+	second := testsupport.Do(t, handler, http.MethodPost, httpapi.APIPrefix+"/ai/executions/exec00000000001/context", token, map[string]any{},
+		map[string]string{"X-Lease-Token": "a-different-lease-token", "Idempotency-Key": key["Idempotency-Key"]})
+	if second.Code != http.StatusConflict {
+		t.Fatalf("expected 409 reusing the same key with a different request, got %d: %s", second.Code, second.Body.String())
+	}
+	data, _ := testsupport.Decode(t, second)["data"].(map[string]any)
+	if data["code"] != "idempotency_conflict" {
+		t.Fatalf("expected data.code = idempotency_conflict, got %v", data)
 	}
 }
 
