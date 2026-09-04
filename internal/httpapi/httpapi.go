@@ -94,6 +94,27 @@ func InputChangedError() *router.ApiError {
 	return codedError(http.StatusConflict, "input_changed", "The input changed since the execution was claimed.")
 }
 
+// IdentityInvalidError is returned when an OIDC identity token fails
+// verification (bad signature, wrong issuer/audience, or expired).
+func IdentityInvalidError() *router.ApiError {
+	return codedError(http.StatusUnauthorized, "identity_invalid", "The identity token is invalid or expired.")
+}
+
+// IdentityUnlinkedError is returned when a verified OIDC identity has no
+// linked account on this service yet. Identities are never auto-provisioned
+// on exchange; a caller must link one explicitly first via an authenticated
+// session.
+func IdentityUnlinkedError() *router.ApiError {
+	return codedError(http.StatusForbidden, "identity_unlinked", "This identity is not linked to an account. Sign in another way first, then link it.")
+}
+
+// IdentityAlreadyLinkedError is returned when linking would conflict with
+// an existing link — either this identity already points at a different
+// account, or the calling account already has a different identity linked.
+func IdentityAlreadyLinkedError() *router.ApiError {
+	return codedError(http.StatusConflict, "identity_already_linked", "This identity (or this account) is already linked to a different party.")
+}
+
 // CheckExpectedVersion enforces optimistic concurrency: if body carries an
 // expected_version, it must match rec's current version. A missing
 // expected_version skips the check.

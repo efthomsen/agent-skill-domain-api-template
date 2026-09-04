@@ -13,6 +13,7 @@ import (
 
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/executions"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/listings"
+	"github.com/efthomsen/agent-skill-domain-api-template/internal/oidcauth"
 	_ "github.com/efthomsen/agent-skill-domain-api-template/migrations"
 )
 
@@ -31,6 +32,7 @@ func main() {
 		Func: func(e *core.ServeEvent) error {
 			listings.RegisterRoutes(e.Router)
 			executions.RegisterRoutes(e.Router, executions.Config{})
+			oidcauth.RegisterRoutes(e.Router, oidcauth.LoadConfig())
 			return e.Next()
 		},
 		Priority: 999,
