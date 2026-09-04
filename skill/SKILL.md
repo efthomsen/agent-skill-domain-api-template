@@ -1,6 +1,6 @@
 ---
 name: manage-template-service
-description: Operate the reference agent-skill-domain-api-template PocketBase service through its domain API. Use when working listings (create, read, update) or when acting as the AI runner that claims and completes queued assessment work via the leased execution loop.
+description: Operate the reference agent-skill-domain-api-template PocketBase service through its domain API. Use when working listings (create, read, update, confirm-and-delete) or when acting as the AI runner that claims and completes queued assessment work via the leased execution loop.
 ---
 
 # Manage Template Service
@@ -18,12 +18,14 @@ TOKEN="$(TEMPLATE_URL=https://template.example.com \
   scripts/auth.sh)"
 ```
 
-The token is short-lived. Re-run `scripts/auth.sh` when a call starts returning 401.
+The token is short-lived. Re-run `scripts/auth.sh` when a call starts returning 401. If the deployment has SSO enabled, see "Authenticate via SSO" below instead.
 
 ## Non-negotiable operating rules
 
 - Every `commands/*` call requires an `Idempotency-Key` header. Reuse the same key only when retrying the exact same request — a different body with a reused key is rejected as a conflict (`data.code: idempotency_conflict`), not silently applied.
 - Every mutating command that targets an existing record takes `expected_version`, the version you last read. A stale value is rejected (`data.code: version_conflict`) rather than silently overwritten — re-read the record and retry with the current version.
+- Some commands (`delete-listing`) require a human's explicit approval before they execute — see "Delete with confirmation" below. Never fabricate an approval or skip the confirmation step.
+- Reading an execution's context also requires its own `Idempotency-Key` — every read is audited, not just every write.
 - Never persist the PocketBase token to disk; re-authenticate per session.
 
 ## Read resources
@@ -57,6 +59,36 @@ curl -s -X POST "$TEMPLATE_URL/api/template/v1/commands/request-assessment" \
 
 `request-assessment` returns `{"execution_id": "...", "input_hash": "..."}` and queues a pending unit of AI work — it does not run the assessment itself.
 
+## Delete with confirmation
+
+`delete-listing` doesn't execute on the first call — it proposes, and waits for a human to decide:
+
+```bash
+DELETE_KEY="delete-listing-$(uuidgen)"
+PROPOSAL="$(curl -s -X POST "$TEMPLATE_URL/api/template/v1/commands/delete-listing" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $DELETE_KEY" \
+  -d '{"listing_id":"'"$LISTING_ID"'","expected_version":1}')"
+CONFIRMATION_ID="$(jq -r '.confirmation_id' <<<"$PROPOSAL")"
+
+# Show the human jq -r '.message' <<<"$PROPOSAL" and wait for an explicit decision.
+# Do not proceed past this point without it.
+
+jq -n --arg id "$CONFIRMATION_ID" --arg decision "approve" '{confirmation_id:$id,decision:$decision}' |
+curl -s -X POST "$TEMPLATE_URL/api/template/v1/commands/decide-confirmation" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: decide-confirmation-$(uuidgen)" --data-binary @-
+
+# Resubmit the ORIGINAL delete-listing request under the SAME Idempotency-Key,
+# now with confirmation_id added:
+curl -s -X POST "$TEMPLATE_URL/api/template/v1/commands/delete-listing" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $DELETE_KEY" \
+  -d '{"listing_id":"'"$LISTING_ID"'","expected_version":1,"confirmation_id":"'"$CONFIRMATION_ID"'"}'
+```
+
+Decline with `{"decision":"decline"}` instead — a declined confirmation cannot be bypassed by resubmitting (`data.code: confirmation_declined`). Replaying the original proposal while it's still pending is safe and returns the same `confirmation_id`, not a duplicate.
+
 ## Claim and execute AI work
 
 ```bash
@@ -72,8 +104,9 @@ else
   EXECUTION_ID="$(jq -r '.execution.id' <<<"$CLAIM_BODY")"
   LEASE_TOKEN="$(jq -r '.lease_token' <<<"$CLAIM_BODY")"
 
-  CONTEXT="$(curl -s "$TEMPLATE_URL/api/template/v1/ai/executions/$EXECUTION_ID/context" \
-    -H "Authorization: Bearer $TOKEN" -H "X-Lease-Token: $LEASE_TOKEN")"
+  CONTEXT="$(curl -s -X POST "$TEMPLATE_URL/api/template/v1/ai/executions/$EXECUTION_ID/context" \
+    -H "Authorization: Bearer $TOKEN" -H "X-Lease-Token: $LEASE_TOKEN" \
+    -H "Idempotency-Key: read-context-$EXECUTION_ID")"
   INPUT_HASH="$(jq -r '.input_hash' <<<"$CONTEXT")"
 
   # ... read $CONTEXT, decide on an assessment ...
@@ -84,7 +117,25 @@ else
 fi
 ```
 
-A lease is exclusive and expires after 30 minutes if not completed, at which point another `claim-next` call can reclaim it. Posting a result twice with the same execution is safe — the second call replays the original outcome rather than reapplying it.
+A lease is exclusive and expires after 30 minutes if not completed, at which point another `claim-next` call can reclaim it. Posting a result twice with the same execution is safe — the second call replays the original outcome rather than reapplying it. Reading context twice with the same `Idempotency-Key` replays the same bundle unchanged; reusing that key for a different execution or a different lease token is a conflict — use a fresh key (e.g. tied to the execution id) per genuinely new read.
+
+## Authenticate via SSO
+
+If `GET /api/template/v1/auth/oidc/config` reports `"enabled": true`, a client can authenticate via the identity provider it names instead of a password:
+
+```bash
+TOKEN="$(TEMPLATE_URL=https://template.example.com scripts/auth-oidc.sh)"
+```
+
+That script fetches the config, performs the device-authorization flow **directly against the provider** (never against this service), and exchanges the resulting `id_token` for a PocketBase token — the same shape `scripts/auth.sh` returns. If the identity isn't linked yet, the exchange fails with `403` / `data.code: identity_unlinked`; sign in another way first (e.g. the password flow), then link it once, deliberately:
+
+```bash
+jq -n --arg id_token "$ID_TOKEN" '{id_token:$id_token}' |
+curl -s -X POST "$TEMPLATE_URL/api/template/v1/auth/oidc/link" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data-binary @-
+```
+
+This service never creates an account automatically just because a valid identity token showed up.
 
 ## Errors and receipts
 
@@ -92,7 +143,12 @@ Every conflict has a stable `data.code` in the response body — branch on that,
 
 | `data.code` | status | meaning |
 |---|---|---|
-| `idempotency_conflict` | 409 | the `Idempotency-Key` was already used with a different request body |
+| `idempotency_conflict` | 409 | the `Idempotency-Key` was already used with a different request |
 | `version_conflict` | 409 | `expected_version` no longer matches the record; re-read and retry |
 | `lease_invalid` | 403 | the lease token is missing, wrong, or the execution isn't in a claimed state |
 | `input_changed` | 409 | the submitted `input_hash` no longer matches what was leased |
+| `confirmation_declined` | 409 | a human declined this action; it cannot be resubmitted as-is |
+| `confirmation_already_decided` | 409 | tried to flip a confirmation that already has a different, terminal decision |
+| `identity_invalid` | 401 | the OIDC identity token failed verification |
+| `identity_unlinked` | 403 | a verified identity has no linked account yet — link one first |
+| `identity_already_linked` | 409 | this identity (or this account) is already linked to someone else |
