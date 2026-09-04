@@ -11,11 +11,24 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/executions"
+	"github.com/efthomsen/agent-skill-domain-api-template/internal/finalizers"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/httpapi"
+	"github.com/efthomsen/agent-skill-domain-api-template/internal/listings"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/testsupport"
 )
 
 const testUserID = "usera0000000001"
+
+// testConfig builds an executions.Config wired the same way main.go wires
+// it, so tests exercise the real finalizer lookup rather than a stub.
+func testConfig(t *testing.T) executions.Config {
+	t.Helper()
+	registry := finalizers.NewRegistry()
+	if err := listings.RegisterFinalizers(registry); err != nil {
+		t.Fatal(err)
+	}
+	return executions.Config{Finalizers: registry}
+}
 
 func seedListing(t *testing.T, app core.App, id string) {
 	t.Helper()
@@ -45,7 +58,7 @@ func TestClaimNextReturns204WhenNothingPending(t *testing.T) {
 	pbApp := testsupport.NewMigratedApp(t)
 	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")
 	rg := testsupport.NewRouter(t, pbApp)
-	executions.RegisterRoutes(rg, executions.Config{})
+	executions.RegisterRoutes(rg, testConfig(t))
 	handler := testsupport.BuildHandler(t, rg)
 	token := testsupport.AuthToken(t, user)
 
@@ -59,7 +72,7 @@ func TestClaimContextResultRoundTrip(t *testing.T) {
 	pbApp := testsupport.NewMigratedApp(t)
 	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")
 	rg := testsupport.NewRouter(t, pbApp)
-	executions.RegisterRoutes(rg, executions.Config{})
+	executions.RegisterRoutes(rg, testConfig(t))
 	handler := testsupport.BuildHandler(t, rg)
 	token := testsupport.AuthToken(t, user)
 
@@ -123,7 +136,7 @@ func TestResultReplayIsIdempotent(t *testing.T) {
 	pbApp := testsupport.NewMigratedApp(t)
 	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")
 	rg := testsupport.NewRouter(t, pbApp)
-	executions.RegisterRoutes(rg, executions.Config{})
+	executions.RegisterRoutes(rg, testConfig(t))
 	handler := testsupport.BuildHandler(t, rg)
 	token := testsupport.AuthToken(t, user)
 
@@ -163,7 +176,7 @@ func TestResultWrongLeaseTokenIsForbidden(t *testing.T) {
 	pbApp := testsupport.NewMigratedApp(t)
 	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")
 	rg := testsupport.NewRouter(t, pbApp)
-	executions.RegisterRoutes(rg, executions.Config{})
+	executions.RegisterRoutes(rg, testConfig(t))
 	handler := testsupport.BuildHandler(t, rg)
 	token := testsupport.AuthToken(t, user)
 
@@ -182,7 +195,7 @@ func TestContextWithoutLeaseTokenIsForbidden(t *testing.T) {
 	pbApp := testsupport.NewMigratedApp(t)
 	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")
 	rg := testsupport.NewRouter(t, pbApp)
-	executions.RegisterRoutes(rg, executions.Config{})
+	executions.RegisterRoutes(rg, testConfig(t))
 	handler := testsupport.BuildHandler(t, rg)
 	token := testsupport.AuthToken(t, user)
 
@@ -200,7 +213,7 @@ func TestResultInputHashMismatchConflicts(t *testing.T) {
 	pbApp := testsupport.NewMigratedApp(t)
 	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")
 	rg := testsupport.NewRouter(t, pbApp)
-	executions.RegisterRoutes(rg, executions.Config{})
+	executions.RegisterRoutes(rg, testConfig(t))
 	handler := testsupport.BuildHandler(t, rg)
 	token := testsupport.AuthToken(t, user)
 
@@ -224,7 +237,7 @@ func TestConcurrentClaimNextLeasesExactlyOnce(t *testing.T) {
 	pbApp := testsupport.NewMigratedApp(t)
 	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")
 	rg := testsupport.NewRouter(t, pbApp)
-	executions.RegisterRoutes(rg, executions.Config{})
+	executions.RegisterRoutes(rg, testConfig(t))
 	handler := testsupport.BuildHandler(t, rg)
 	token := testsupport.AuthToken(t, user)
 
@@ -275,7 +288,9 @@ func TestConcurrentClaimNextLeasesExactlyOnce(t *testing.T) {
 func TestExpiredLeaseIsReclaimable(t *testing.T) {
 	now := time.Now()
 	clock := &fakeClock{t: now}
-	cfg := executions.Config{LeaseTTL: time.Second, Now: clock.Now}
+	cfg := testConfig(t)
+	cfg.LeaseTTL = time.Second
+	cfg.Now = clock.Now
 
 	pbApp := testsupport.NewMigratedApp(t)
 	user := testsupport.AddUser(t, pbApp, testUserID, "a@example.com")

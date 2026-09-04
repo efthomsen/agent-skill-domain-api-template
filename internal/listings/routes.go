@@ -13,8 +13,32 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
 
+	"github.com/efthomsen/agent-skill-domain-api-template/internal/finalizers"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/httpapi"
 )
+
+// RegisterFinalizers registers this package's task_key finalizers into
+// registry. Call once at boot, before finalizers.ValidateCoverage.
+func RegisterFinalizers(registry *finalizers.Registry) error {
+	return registry.Register("assess_listing", AssessListingFinalizer)
+}
+
+// AssessListingFinalizer applies an agent's assessment output to the
+// listing an "assess_listing" execution targeted.
+func AssessListingFinalizer(tx core.App, execution *core.Record, output map[string]any) (map[string]any, error) {
+	target, err := tx.FindRecordById(execution.GetString("target_collection"), execution.GetString("target_id"))
+	if err != nil {
+		return nil, err
+	}
+	if assessment, ok := output["assessment"].(string); ok {
+		target.Set("assessment", assessment)
+	}
+	target.Set("version", target.GetInt("version")+1)
+	if err := tx.Save(target); err != nil {
+		return nil, err
+	}
+	return map[string]any{"listing_id": target.Id, "version": target.GetInt("version")}, nil
+}
 
 // RegisterRoutes wires the listings resource and command routes onto rg
 // under httpapi.APIPrefix.

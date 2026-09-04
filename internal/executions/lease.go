@@ -7,6 +7,7 @@
 package executions
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/pocketbase/dbx"
@@ -14,14 +15,17 @@ import (
 	"github.com/pocketbase/pocketbase/tools/security"
 	"github.com/pocketbase/pocketbase/tools/types"
 
+	"github.com/efthomsen/agent-skill-domain-api-template/internal/finalizers"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/httpapi"
 )
 
-// Config controls lease behavior. Now is injectable so tests can simulate
-// lease expiry without sleeping.
+// Config controls lease behavior and how completed executions are
+// finalized. Now is injectable so tests can simulate lease expiry without
+// sleeping.
 type Config struct {
-	LeaseTTL time.Duration
-	Now      func() time.Time
+	LeaseTTL   time.Duration
+	Now        func() time.Time
+	Finalizers *finalizers.Registry
 }
 
 func (c Config) leaseTTL() time.Duration {
@@ -122,19 +126,16 @@ func SubmitResult(app core.App, cfg Config, id, leaseToken, inputHash string, ou
 			return httpapi.InputChangedError()
 		}
 
-		target, err := tx.FindRecordById(rec.GetString("target_collection"), rec.GetString("target_id"))
+		finalize, ok := cfg.Finalizers.Lookup(rec.GetString("task_key"))
+		if !ok {
+			return fmt.Errorf("no registered finalizer for task key %q", rec.GetString("task_key"))
+		}
+		finalizeResult, err := finalize(tx, rec, output)
 		if err != nil {
 			return err
 		}
-		if assessment, ok := output["assessment"].(string); ok {
-			target.Set("assessment", assessment)
-		}
-		target.Set("version", target.GetInt("version")+1)
-		if err := tx.Save(target); err != nil {
-			return err
-		}
 
-		result = map[string]any{"listing_id": target.Id, "version": target.GetInt("version")}
+		result = finalizeResult
 		rec.Set("output_json", output)
 		rec.Set("result_json", result)
 		rec.Set("status", "completed")

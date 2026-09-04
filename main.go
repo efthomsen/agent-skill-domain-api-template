@@ -13,6 +13,7 @@ import (
 
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/confirmations"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/executions"
+	"github.com/efthomsen/agent-skill-domain-api-template/internal/finalizers"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/listings"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/oidcauth"
 	_ "github.com/efthomsen/agent-skill-domain-api-template/migrations"
@@ -31,9 +32,20 @@ func main() {
 
 	app.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
 		Func: func(e *core.ServeEvent) error {
+			// App-defined collections only exist once RunAllMigrations has
+			// run, which happens earlier in apis.Serve — but still before
+			// this hook — so it's safe to query them here, not earlier.
+			registry := finalizers.NewRegistry()
+			if err := listings.RegisterFinalizers(registry); err != nil {
+				return err
+			}
+			if err := finalizers.ValidateCoverage(e.App, registry); err != nil {
+				return err
+			}
+
 			listings.RegisterRoutes(e.Router)
 			confirmations.RegisterRoutes(e.Router)
-			executions.RegisterRoutes(e.Router, executions.Config{})
+			executions.RegisterRoutes(e.Router, executions.Config{Finalizers: registry})
 			oidcauth.RegisterRoutes(e.Router, oidcauth.LoadConfig())
 			return e.Next()
 		},
