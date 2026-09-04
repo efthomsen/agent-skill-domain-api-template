@@ -11,6 +11,7 @@ import (
 	"github.com/pocketbase/pocketbase/plugins/migratecmd"
 	"github.com/pocketbase/pocketbase/tools/hook"
 
+	"github.com/efthomsen/agent-skill-domain-api-template/internal/confirmations"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/executions"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/listings"
 	"github.com/efthomsen/agent-skill-domain-api-template/internal/oidcauth"
@@ -31,6 +32,7 @@ func main() {
 	app.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
 		Func: func(e *core.ServeEvent) error {
 			listings.RegisterRoutes(e.Router)
+			confirmations.RegisterRoutes(e.Router)
 			executions.RegisterRoutes(e.Router, executions.Config{})
 			oidcauth.RegisterRoutes(e.Router, oidcauth.LoadConfig())
 			return e.Next()

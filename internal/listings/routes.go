@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
@@ -23,10 +24,11 @@ func RegisterRoutes(rg *router.Router[*core.RequestEvent]) {
 	rg.POST(httpapi.APIPrefix+"/commands/create-listing", createAction).Bind(apis.RequireAuth())
 	rg.POST(httpapi.APIPrefix+"/commands/update-listing", updateAction).Bind(apis.RequireAuth())
 	rg.POST(httpapi.APIPrefix+"/commands/request-assessment", requestAssessmentAction).Bind(apis.RequireAuth())
+	rg.POST(httpapi.APIPrefix+"/commands/delete-listing", deleteListingAction).Bind(apis.RequireAuth())
 }
 
 func listAction(e *core.RequestEvent) error {
-	records, err := e.App.FindRecordsByFilter("listings", "user_id = {:user}", "-created", 0, 0,
+	records, err := e.App.FindRecordsByFilter("listings", "user_id = {:user} && deleted_at = ''", "-created", 0, 0,
 		map[string]any{"user": httpapi.AuthID(e)})
 	if err != nil {
 		return err
@@ -150,6 +152,42 @@ func requestAssessmentAction(e *core.RequestEvent) error {
 	})
 }
 
+// deleteListingAction soft-deletes a listing — chosen as the example
+// confirmable command because it's a believable "needs a human's okay"
+// action in any domain, and a soft delete doesn't dangle the target_id an
+// in-flight execution might still reference.
+func deleteListingAction(e *core.RequestEvent) error {
+	body, err := httpapi.Body(e)
+	if err != nil {
+		return err
+	}
+	userID := httpapi.AuthID(e)
+	listingID, _ := body["listing_id"].(string)
+
+	return httpapi.RunConfirmable(e, "delete-listing", body, func(tx core.App, confirmed bool) (int, map[string]any, error) {
+		rec, err := findOwnedListing(tx, listingID, userID)
+		if err != nil {
+			return 0, nil, apis.NewNotFoundError("", err)
+		}
+		if err := httpapi.CheckExpectedVersion(body, rec); err != nil {
+			return 0, nil, err
+		}
+
+		if !confirmed {
+			return httpapi.NeedsConfirmation(tx, e, body, "delete-listing", "destructive",
+				"Delete the listing at "+rec.GetString("address")+"?",
+				map[string]any{"listing_id": rec.Id, "address": rec.GetString("address")})
+		}
+
+		rec.Set("deleted_at", time.Now())
+		rec.Set("version", rec.GetInt("version")+1)
+		if err := tx.Save(rec); err != nil {
+			return 0, nil, err
+		}
+		return http.StatusOK, map[string]any{"listing": listingData(rec)}, nil
+	})
+}
+
 func findOwnedListing(app core.App, id, userID string) (*core.Record, error) {
 	if id == "" {
 		return nil, sql.ErrNoRows
@@ -160,6 +198,9 @@ func findOwnedListing(app core.App, id, userID string) (*core.Record, error) {
 	}
 	if rec.GetString("user_id") != userID {
 		return nil, errors.New("listing not owned by caller")
+	}
+	if !rec.GetDateTime("deleted_at").IsZero() {
+		return nil, sql.ErrNoRows
 	}
 	return rec, nil
 }

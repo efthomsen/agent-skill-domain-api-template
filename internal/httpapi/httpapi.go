@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/apis"
@@ -115,6 +116,18 @@ func IdentityAlreadyLinkedError() *router.ApiError {
 	return codedError(http.StatusConflict, "identity_already_linked", "This identity (or this account) is already linked to a different party.")
 }
 
+// ConfirmationDeclinedError is returned when a caller tries to proceed
+// past a confirmation a human has already declined.
+func ConfirmationDeclinedError() *router.ApiError {
+	return codedError(http.StatusConflict, "confirmation_declined", "This action was declined and cannot be resubmitted as-is.")
+}
+
+// ConfirmationAlreadyDecidedError is returned when a caller tries to
+// decide a confirmation that already has a different, terminal decision.
+func ConfirmationAlreadyDecidedError() *router.ApiError {
+	return codedError(http.StatusConflict, "confirmation_already_decided", "This confirmation already has a different decision.")
+}
+
 // CheckExpectedVersion enforces optimistic concurrency: if body carries an
 // expected_version, it must match rec's current version. A missing
 // expected_version skips the check.
@@ -217,6 +230,174 @@ func RunIdempotent(e *core.RequestEvent, action string, body map[string]any, fn 
 
 		status = fnStatus
 		response = fnResponse
+		return nil
+	})
+	if txErr != nil {
+		return txErr
+	}
+
+	return e.JSON(status, response)
+}
+
+// NeedsConfirmation creates a pending agent_confirmations row for action
+// and returns the response a RunConfirmable command's fn should return on
+// its first, unconfirmed call.
+func NeedsConfirmation(tx core.App, e *core.RequestEvent, body map[string]any, action, riskTier, prompt string, proposedChange map[string]any) (int, map[string]any, error) {
+	requestHash, err := HashCanonical(body)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	confirmationsCollection, err := tx.FindCollectionByNameOrId("agent_confirmations")
+	if err != nil {
+		return 0, nil, err
+	}
+	confirmation := core.NewRecord(confirmationsCollection)
+	confirmation.Set("user_id", AuthID(e))
+	confirmation.Set("idempotency_key", Header(e, "Idempotency-Key"))
+	confirmation.Set("action", action)
+	confirmation.Set("request_hash", requestHash)
+	confirmation.Set("risk_tier", riskTier)
+	confirmation.Set("prompt", prompt)
+	confirmation.Set("proposed_change", proposedChange)
+	confirmation.Set("status", "pending")
+	if err := tx.Save(confirmation); err != nil {
+		return 0, nil, err
+	}
+
+	return http.StatusAccepted, map[string]any{
+		"status":          "confirmation_required",
+		"confirmation_id": confirmation.Id,
+		"message":         prompt,
+	}, nil
+}
+
+// RunConfirmable enforces the Idempotency-Key contract for a command that
+// requires a human's confirmation before it executes.
+//
+// The first call with a given key runs fn(tx, false), which is expected to
+// call NeedsConfirmation and return that response — it must not perform
+// the actual mutation. A later call reusing the SAME key, now with a body
+// carrying a "confirmation_id" for an *approved* confirmation matching the
+// original request, runs fn(tx, true) — the only place true is ever
+// passed, so fn never needs to (and must not) trust body["confirmation_id"]
+// itself; trust is decided exactly once, centrally, here.
+//
+// Unlike RunIdempotent's terminal replay, a stored "confirmation_required"
+// response is never treated as final: it is re-evaluated on every call
+// until a human decides, and replaying the original key+body while still
+// pending returns the stored response unchanged without creating a second
+// confirmation row. If fn's confirmed call fails (e.g. a stale
+// expected_version), the whole transaction rolls back — including the
+// confirmation's consumed flip — so it stays approved and retryable
+// without asking the human again.
+func RunConfirmable(e *core.RequestEvent, action string, body map[string]any, fn func(tx core.App, confirmed bool) (status int, response map[string]any, err error)) error {
+	key := Header(e, "Idempotency-Key")
+	if key == "" {
+		return apis.NewBadRequestError("Idempotency-Key header is required.", nil)
+	}
+	userID := AuthID(e)
+
+	requestHash, err := HashCanonical(body)
+	if err != nil {
+		return err
+	}
+
+	var status int
+	var response map[string]any
+
+	txErr := e.App.RunInTransaction(func(tx core.App) error {
+		existing, ferr := tx.FindFirstRecordByFilter(
+			"api_commands",
+			"user_id = {:user} && idempotency_key = {:key}",
+			dbx.Params{"user": userID, "key": key},
+		)
+		if ferr != nil && !errors.Is(ferr, sql.ErrNoRows) {
+			return ferr
+		}
+
+		if existing == nil {
+			commandsCollection, cerr := tx.FindCollectionByNameOrId("api_commands")
+			if cerr != nil {
+				return cerr
+			}
+			commandRecord := core.NewRecord(commandsCollection)
+			commandRecord.Set("user_id", userID)
+			commandRecord.Set("idempotency_key", key)
+			commandRecord.Set("action", action)
+			commandRecord.Set("request_hash", requestHash)
+
+			fnStatus, fnResponse, fnErr := fn(tx, false)
+			if fnErr != nil {
+				return fnErr
+			}
+
+			commandRecord.Set("status", "confirmation_required")
+			commandRecord.Set("response_status", fnStatus)
+			commandRecord.Set("response_json", fnResponse)
+			if serr := tx.Save(commandRecord); serr != nil {
+				return serr
+			}
+
+			status, response = fnStatus, fnResponse
+			return nil
+		}
+
+		if existing.GetString("status") == "completed" {
+			if existing.GetString("request_hash") != requestHash {
+				return IdempotencyConflictError()
+			}
+			status = existing.GetInt("response_status")
+			if decoded, ok := JSONField(existing, "response_json", nil).(map[string]any); ok {
+				response = decoded
+			}
+			return nil
+		}
+
+		// status == "confirmation_required": re-evaluate against any
+		// confirmation_id in this (possibly different) body, but never
+		// create a second confirmation for the same original request.
+		if confirmationID, _ := body["confirmation_id"].(string); confirmationID != "" {
+			confirmation, cerr := tx.FindRecordById("agent_confirmations", confirmationID)
+			if cerr == nil &&
+				confirmation.GetString("user_id") == userID &&
+				confirmation.GetString("idempotency_key") == key &&
+				confirmation.GetString("request_hash") == existing.GetString("request_hash") {
+				switch confirmation.GetString("status") {
+				case "declined":
+					return ConfirmationDeclinedError()
+				case "approved":
+					confirmation.Set("status", "consumed")
+					confirmation.Set("consumed_at", time.Now())
+					if serr := tx.Save(confirmation); serr != nil {
+						return serr
+					}
+
+					fnStatus, fnResponse, fnErr := fn(tx, true)
+					if fnErr != nil {
+						return fnErr
+					}
+
+					existing.Set("status", "completed")
+					existing.Set("request_hash", requestHash)
+					existing.Set("response_status", fnStatus)
+					existing.Set("response_json", fnResponse)
+					if serr := tx.Save(existing); serr != nil {
+						return serr
+					}
+
+					status, response = fnStatus, fnResponse
+					return nil
+				}
+			}
+		}
+
+		// Still pending (or an unrecognized/mismatched confirmation_id):
+		// replay the original confirmation_required response unchanged.
+		status = existing.GetInt("response_status")
+		if decoded, ok := JSONField(existing, "response_json", nil).(map[string]any); ok {
+			response = decoded
+		}
 		return nil
 	})
 	if txErr != nil {
